@@ -1,45 +1,151 @@
-// ============================================================
-// LINE Calorie Estimator Bot — FREE VERSION
-// Uses: LINE Messaging API (free) + Google Gemini API (free tier)
-// Host on: Render or Railway (free tier)
-// ============================================================
-
 import express from "express";
 import crypto from "crypto";
 import fetch from "node-fetch";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
-// ── Config — set these as environment variables ──────────────
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // Free at aistudio.google.com
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// ── Signature verification middleware ────────────────────────
-app.use(
-  "/webhook",
-  express.raw({ type: "application/json" }),
-  (req, res, next) => {
-    const signature = req.headers["x-line-signature"];
-    const hmac = crypto
-      .createHmac("sha256", LINE_CHANNEL_SECRET)
-      .update(req.body)
-      .digest("base64");
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 
-    if (signature !== hmac) {
-      return res.status(401).send("Invalid signature");
+// Verify LINE signature
+function verifySignature(rawBody, signature) {
+  const hash = crypto
+    .createHmac("SHA256", LINE_CHANNEL_SECRET)
+    .update(rawBody)
+    .digest("base64");
+  return hash === signature;
+}
+
+// Download image from LINE and convert to base64
+async function getLineImageAsBase64(messageId) {
+  const url = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` }
+  });
+  if (!res.ok) throw new Error(`LINE image download failed: ${res.status}`);
+  const buffer = await res.buffer();
+  return buffer.toString("base64");
+}
+
+// Analyze food image with Gemini
+async function analyzeFoodWithGemini(base64Image) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+  const prompt = `You are a nutrition expert. Look at this food image and provide a calorie estimate.
+
+Please respond in this exact format:
+🍽️ Food: [name of food(s) you see]
+🔥 Calories: [estimated calories] kcal
+💪 Protein: [grams]g
+🍚 Carbs: [grams]g
+🧈 Fat: [grams]g
+📏 Portion: [estimated portion size]
+💡 Tip: [one short nutrition tip]
+
+If you cannot identify food in the image, say "I could not identify food in this image. Please send a clearer photo of food."
+
+Be specific and give your best estimate even if you are not 100% sure.`;
+
+  const body = {
+    contents: [{
+      parts: [
+        {
+          inline_data: {
+            mime_type: "image/jpeg",
+            data: base64Image
+          }
+        },
+        {
+          text: prompt
+        }
+      ]
+    }],
+    generationConfig: {
+      temperature: 0.4,
+      maxOutputTokens: 512
     }
-    req.body = JSON.parse(req.body);
-    next();
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  const data = await res.json();
+  console.log("Gemini raw response:", JSON.stringify(data, null, 2));
+
+  if (!res.ok) {
+    throw new Error(`Gemini API error: ${data?.error?.message || res.status}`);
   }
-);
 
-app.use(express.json());
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) {
+    throw new Error("Gemini returned empty response");
+  }
 
-// ── Webhook endpoint ─────────────────────────────────────────
+  return text;
+}
+
+// Reply to LINE user
+async function replyToLine(replyToken, message) {
+  await fetch("https://api.line.me/v2/bot/message/reply", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
+    },
+    body: JSON.stringify({
+      replyToken,
+      messages: [{ type: "text", text: message }]
+    })
+  });
+}
+
+// Handle incoming messages
+async function handleMessage(event) {
+  const { replyToken, message } = event;
+
+  if (message.type === "image") {
+    try {
+      console.log("Downloading image from LINE, message ID:", message.id);
+      const base64Image = await getLineImageAsBase64(message.id);
+      console.log("Image downloaded, size:", base64Image.length, "chars");
+
+      console.log("Sending to Gemini...");
+      const result = await analyzeFoodWithGemini(base64Image);
+      console.log("Gemini result:", result);
+
+      await replyToLine(replyToken, result);
+    } catch (err) {
+      console.error("Error:", err.message);
+      await replyToLine(replyToken, "❌ Sorry, I had trouble analyzing that image. Please try again with a clear photo of your food.");
+    }
+  } else if (message.type === "text") {
+    const text = message.text.toLowerCase();
+    if (text.includes("hi") || text.includes("hello") || text.includes("สวัสดี")) {
+      await replyToLine(replyToken, "👋 Hello! Send me a photo of your food and I'll estimate the calories for you! 📸🍽️");
+    } else {
+      await replyToLine(replyToken, "📸 Please send a photo of your food and I'll calculate the calories!");
+    }
+  }
+}
+
+// Webhook endpoint
 app.post("/webhook", async (req, res) => {
-  res.status(200).send("OK"); // Respond to LINE immediately
+  const signature = req.headers["x-line-signature"];
+  if (!verifySignature(req.rawBody, signature)) {
+    console.log("Invalid signature");
+    return res.status(403).send("Invalid signature");
+  }
+
+  res.status(200).send("OK");
 
   const events = req.body.events || [];
   for (const event of events) {
@@ -49,144 +155,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ── Message handler ──────────────────────────────────────────
-async function handleMessage(event) {
-  const replyToken = event.replyToken;
-  const message = event.message;
+app.get("/", (req, res) => res.send("LINE Calorie Bot is running! 🍽️"));
 
-  // Handle image messages
-  if (message.type === "image") {
-    try {
-      // Download image from LINE as base64
-      const imageBase64 = await getLineImageAsBase64(message.id);
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-      // Estimate calories using Gemini Vision (free)
-      const result = await estimateCaloriesWithGemini(imageBase64);
-
-      await replyText(replyToken, result);
-    } catch (err) {
-      console.error("Error:", err);
-      await replyText(
-        replyToken,
-        "❌ Sorry, I couldn't analyse that image. Please try again with a clearer food photo!"
-      );
-    }
-    return;
-  }
-
-  // Handle text messages
-  if (message.type === "text") {
-    const text = message.text.trim().toLowerCase();
-    if (["hi", "hello", "help", "start"].includes(text)) {
-      await replyText(
-        replyToken,
-        `🥗 Food Calorie Estimator Bot\n\nSend me a photo of your food and I'll estimate:\n\n🔢 Total calories\n🥩 Protein / Carbs / Fat\n🍽️ Portion size\n💡 Nutrition tips\n\nJust send any food photo to get started!`
-      );
-    } else {
-      await replyText(
-        replyToken,
-        "📸 Send me a photo of your food and I'll estimate the calories for you!"
-      );
-    }
-  }
-}
-
-// ── Download image from LINE as base64 ───────────────────────
-async function getLineImageAsBase64(messageId) {
-  const response = await fetch(
-    `https://api-data.line.me/v2/bot/message/${messageId}/content`,
-    {
-      headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
-    }
-  );
-
-  if (!response.ok) throw new Error(`LINE image download failed: ${response.status}`);
-
-  const buffer = await response.buffer();
-  return buffer.toString("base64");
-}
-
-// ── Estimate calories using Gemini Vision (FREE) ─────────────
-async function estimateCaloriesWithGemini(imageBase64) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-
-  const prompt = `You are a nutrition expert. Analyse this food image and give a calorie estimate.
-
-Respond in this exact format:
-
-🍽️ Food Identified:
-[List the foods/dishes you see]
-
-🔢 Estimated Calories:
-Total: X – Y kcal
-
-📊 Macronutrients (approx):
-• Protein: Xg
-• Carbohydrates: Xg
-• Fat: Xg
-
-🥄 Portion Size:
-[Describe the estimated portion]
-
-💡 Nutrition Notes:
-[2-3 short tips about this meal]
-
-⚠️ Note: Estimates based on visual assessment only. Actual values vary by preparation and ingredients.
-
-If no food is visible, ask for a clearer photo.`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [
-        {
-          parts: [
-            {
-              inline_data: {
-                mime_type: "image/jpeg",
-                data: imageBase64,
-              },
-            },
-            { text: prompt },
-          ],
-        },
-      ],
-      generationConfig: {
-        maxOutputTokens: 512,
-        temperature: 0.4,
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Gemini API error: ${err}`);
-  }
-
-  const data = await response.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-  if (!text) throw new Error("Empty response from Gemini");
-  return text;
-}
-
-// ── Reply via LINE Messaging API ──────────────────────────────
-async function replyText(replyToken, text) {
-  await fetch("https://api.line.me/v2/bot/message/reply", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-    },
-    body: JSON.stringify({
-      replyToken,
-      messages: [{ type: "text", text }],
-    }),
-  });
-}
-
-// ── Health check ──────────────────────────────────────────────
-app.get("/", (req, res) => res.send("LINE Calorie Bot (Free) is running! ✅"));
-
-app.listen(PORT, () => console.log(`Bot running on port ${PORT}`));
