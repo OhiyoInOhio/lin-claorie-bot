@@ -1,0 +1,18 @@
+{
+  "name": "line-calorie-bot-free",
+  "version": "1.0.0",
+  "description": "Free LINE Bot that estimates food calories using Gemini Vision",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
